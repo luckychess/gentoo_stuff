@@ -1,0 +1,149 @@
+diff -ur NVIDIA-Linux-x86_64-304.135/kernel/nv-linux.h NVIDIA-Linux-x86_64-304.135.patched/kernel/nv-linux.h
+--- NVIDIA-Linux-x86_64-304.135/kernel/nv-linux.h	2017-03-28 19:07:32.610523759 +0200
++++ NVIDIA-Linux-x86_64-304.135.patched/kernel/nv-linux.h	2017-03-28 20:05:48.159192066 +0200
+@@ -2082,6 +2082,8 @@
+  *    2016 Dec 14:5b56d49fc31dbb0487e14ead790fc81ca9fb2c99
+  */
+ 
++#include <linux/version.h>
++
+ #if defined(NV_GET_USER_PAGES_REMOTE_PRESENT)
+     #if defined(NV_GET_USER_PAGES_HAS_WRITE_AND_FORCE_ARGS)
+         #define NV_GET_USER_PAGES           get_user_pages
+@@ -2129,9 +2131,14 @@
+ 
+         #else
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)
+                return get_user_pages_remote(tsk, mm, start, nr_pages, flags,
+                                             pages, vmas);
+ 
++#else
++               return get_user_pages_remote(tsk, mm, start, nr_pages, flags,
++                                            pages, vmas, NULL);
++#endif
+         #endif
+ 
+         }
+diff -ur NVIDIA-Linux-x86_64-304.135/kernel/nv-p2p.c NVIDIA-Linux-x86_64-304.135.patched/kernel/nv-p2p.c
+--- NVIDIA-Linux-x86_64-304.135/kernel/nv-p2p.c	2017-03-28 19:07:32.610523759 +0200
++++ NVIDIA-Linux-x86_64-304.135.patched/kernel/nv-p2p.c	2017-03-28 19:15:47.229290432 +0200
+@@ -112,7 +112,7 @@
+ int nvidia_p2p_get_pages(
+     uint64_t p2p_token,
+     uint32_t va_space,
+-    uint64_t virtual_address,
++    uint64_t address,
+     uint64_t length,
+     struct nvidia_p2p_page_table **page_table,
+     void (*free_callback)(void * data),
+@@ -136,7 +136,7 @@
+         return -ENOMEM;
+ 
+     status = rm_p2p_get_pages(sp, p2p_token, va_space,
+-            virtual_address, length, &physical_addresses, &wreqmb_h,
++            address, length, &physical_addresses, &wreqmb_h,
+             &rreqmb_h, &entries, *page_table,
+             free_callback, data);
+     if (status != RM_OK)
+@@ -195,7 +195,7 @@
+                 nvidia_p2p_page_t_cache);
+     }
+ 
+-    rm_p2p_put_pages(sp, p2p_token, va_space, virtual_address,
++    rm_p2p_put_pages(sp, p2p_token, va_space, address,
+             *page_table);
+ 
+     os_free_mem((*page_table)->pages);
+@@ -232,7 +232,7 @@
+ int nvidia_p2p_put_pages(
+     uint64_t p2p_token,
+     uint32_t va_space,
+-    uint64_t virtual_address,
++    uint64_t address,
+     struct nvidia_p2p_page_table *page_table
+ )
+ {
+@@ -243,7 +243,7 @@
+     if (sp == NULL)
+         return -ENOMEM;
+ 
+-    status = rm_p2p_put_pages(sp, p2p_token, va_space, virtual_address,
++    status = rm_p2p_put_pages(sp, p2p_token, va_space, address,
+             page_table);
+     if (status == RM_OK)
+         nvidia_p2p_free_page_table(page_table);
+diff -ur NVIDIA-Linux-x86_64-304.135/kernel/nv-pat.c NVIDIA-Linux-x86_64-304.135.patched/kernel/nv-pat.c
+--- NVIDIA-Linux-x86_64-304.135/kernel/nv-pat.c	2017-03-28 19:07:32.610523759 +0200
++++ NVIDIA-Linux-x86_64-304.135.patched/kernel/nv-pat.c	2017-03-28 19:19:26.919220727 +0200
+@@ -203,6 +203,7 @@
+ }
+ 
+ #if defined(NV_ENABLE_PAT_SUPPORT) && defined(NV_ENABLE_HOTPLUG_CPU)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)
+ static int
+ nvidia_cpu_callback(struct notifier_block *nfb, unsigned long action, void *hcpu)
+ {
+@@ -234,6 +235,34 @@
+     .notifier_call = nvidia_cpu_callback,
+     .priority = 0
+ };
++#else
++static int nvidia_cpu_online(unsigned int hcpu)
++{
++    unsigned int cpu = get_cpu();
++    if (cpu == hcpu)
++        nv_setup_pat_entries(NULL);
++    else
++        NV_SMP_CALL_FUNCTION(nv_setup_pat_entries, (void *)(long int)hcpu, 1);
++
++    put_cpu();
++
++    return 0;
++}
++
++static int nvidia_cpu_down_prep(unsigned int hcpu)
++{
++    unsigned int cpu = get_cpu();
++    if (cpu == hcpu)
++        nv_restore_pat_entries(NULL);
++    else
++        NV_SMP_CALL_FUNCTION(nv_restore_pat_entries, (void *)(long int)hcpu, 1);
++
++    put_cpu();
++
++    return 0;
++}
++#endif
++
+ #endif
+ 
+ int nv_init_pat_support(nv_stack_t *sp)
+@@ -255,7 +284,14 @@
+ #if defined(NV_ENABLE_PAT_SUPPORT) && defined(NV_ENABLE_HOTPLUG_CPU)
+         if (nv_pat_mode == NV_PAT_MODE_BUILTIN)
+         {
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)
+             if (register_hotcpu_notifier(&nv_hotcpu_nfb) != 0)
++#else
++            if (cpuhp_setup_state(CPUHP_AP_ONLINE_DYN,
++                                  "gpu/nvidia:online",
++                                  nvidia_cpu_online,
++                                  nvidia_cpu_down_prep) != 0)
++#endif
+             {
+                 nv_disable_pat_support();
+                 nv_printf(NV_DBG_ERRORS,
+@@ -280,7 +316,11 @@
+     {
+         nv_disable_pat_support();
+ #if defined(NV_ENABLE_PAT_SUPPORT) && defined(NV_ENABLE_HOTPLUG_CPU)
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)
+         unregister_hotcpu_notifier(&nv_hotcpu_nfb);
++#else
++        cpuhp_remove_state_nocalls(CPUHP_AP_ONLINE_DYN);
++#endif
+ #endif
+     }
+ }
+ 
